@@ -1,6 +1,6 @@
 // +build !windows
 
-package chrootarchive
+package chrootarchive // import "github.com/docker/docker/pkg/chrootarchive"
 
 import (
 	"fmt"
@@ -14,6 +14,7 @@ import (
 func init() {
 	reexec.Register("docker-applyLayer", applyLayer)
 	reexec.Register("docker-untar", untar)
+	reexec.Register("docker-tar", tar)
 }
 
 func fatal(err error) {
@@ -23,6 +24,6 @@ func fatal(err error) {
 
 // flush consumes all the bytes from the reader discarding
 // any errors
-func flush(r io.Reader) {
-	io.Copy(ioutil.Discard, r)
+func flush(r io.Reader) (bytes int64, err error) {
+	return io.Copy(ioutil.Discard, r)
 }

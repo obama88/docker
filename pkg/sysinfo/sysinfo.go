@@ -1,4 +1,4 @@
-package sysinfo
+package sysinfo // import "github.com/docker/docker/pkg/sysinfo"
 
 import "github.com/docker/docker/pkg/parsers"
 
@@ -14,18 +14,25 @@ type SysInfo struct {
 	cgroupCPUInfo
 	cgroupBlkioInfo
 	cgroupCpusetInfo
+	cgroupPids
+
+	// Whether the kernel supports cgroup namespaces or not
+	CgroupNamespaces bool
 
 	// Whether IPv4 forwarding is supported or not, if this was disabled, networking will not work
 	IPv4ForwardingDisabled bool
 
 	// Whether bridge-nf-call-iptables is supported or not
-	BridgeNfCallIptablesDisabled bool
+	BridgeNFCallIPTablesDisabled bool
 
 	// Whether bridge-nf-call-ip6tables is supported or not
-	BridgeNfCallIP6tablesDisabled bool
+	BridgeNFCallIP6TablesDisabled bool
 
 	// Whether the cgroup has the mountpoint of "devices" or not
 	CgroupDevicesEnabled bool
+
+	// Whether the cgroup is in unified mode (v2).
+	CgroupUnified bool
 }
 
 type cgroupMemInfo struct {
@@ -46,17 +53,20 @@ type cgroupMemInfo struct {
 
 	// Whether kernel memory limit is supported or not
 	KernelMemory bool
+
+	// Whether kernel memory TCP limit is supported or not
+	KernelMemoryTCP bool
 }
 
 type cgroupCPUInfo struct {
 	// Whether CPU shares is supported or not
 	CPUShares bool
 
-	// Whether CPU CFS(Completely Fair Scheduler) period is supported or not
-	CPUCfsPeriod bool
+	// Whether CPU CFS (Completely Fair Scheduler) is supported
+	CPUCfs bool
 
-	// Whether CPU CFS(Completely Fair Scheduler) quota is supported or not
-	CPUCfsQuota bool
+	// Whether CPU real-time scheduler is supported
+	CPURealtime bool
 }
 
 type cgroupBlkioInfo struct {
@@ -90,6 +100,11 @@ type cgroupCpusetInfo struct {
 	Mems string
 }
 
+type cgroupPids struct {
+	// Whether Pids Limit is supported or not
+	PidsLimit bool
+}
+
 // IsCpusetCpusAvailable returns `true` if the provided string set is contained
 // in cgroup's cpuset.cpus set, `false` otherwise.
 // If error is not nil a parsing error occurred.
@@ -105,11 +120,19 @@ func (c cgroupCpusetInfo) IsCpusetMemsAvailable(provided string) (bool, error) {
 }
 
 func isCpusetListAvailable(provided, available string) (bool, error) {
-	parsedProvided, err := parsers.ParseUintList(provided)
+	parsedAvailable, err := parsers.ParseUintList(available)
 	if err != nil {
 		return false, err
 	}
-	parsedAvailable, err := parsers.ParseUintList(available)
+	// 8192 is the normal maximum number of CPUs in Linux, so accept numbers up to this
+	// or more if we actually have more CPUs.
+	max := 8192
+	for m := range parsedAvailable {
+		if m > max {
+			max = m
+		}
+	}
+	parsedProvided, err := parsers.ParseUintListMaximum(provided, max)
 	if err != nil {
 		return false, err
 	}

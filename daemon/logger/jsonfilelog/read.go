@@ -1,35 +1,19 @@
-package jsonfilelog
+package jsonfilelog // import "github.com/docker/docker/daemon/logger/jsonfilelog"
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"io"
-	"os"
-	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/filenotify"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/jsonlog"
+	"github.com/docker/docker/daemon/logger/jsonfilelog/jsonlog"
+	"github.com/docker/docker/daemon/logger/loggerutils"
 	"github.com/docker/docker/pkg/tailfile"
+	"github.com/sirupsen/logrus"
 )
 
 const maxJSONDecodeRetry = 20000
-
-func decodeLogLine(dec *json.Decoder, l *jsonlog.JSONLog) (*logger.Message, error) {
-	l.Reset()
-	if err := dec.Decode(l); err != nil {
-		return nil, err
-	}
-	msg := &logger.Message{
-		Source:    l.Stream,
-		Timestamp: l.Created,
-		Line:      []byte(l.Log),
-	}
-	return msg, nil
-}
 
 // ReadLogs implements the logger's LogReader interface for the logs
 // created by this driver.
@@ -40,177 +24,104 @@ func (l *JSONFileLogger) ReadLogs(config logger.ReadConfig) *logger.LogWatcher {
 	return logWatcher
 }
 
-func (l *JSONFileLogger) readLogs(logWatcher *logger.LogWatcher, config logger.ReadConfig) {
-	defer close(logWatcher.Msg)
-
-	pth := l.writer.LogPath()
-	var files []io.ReadSeeker
-	for i := l.writer.MaxFiles(); i > 1; i-- {
-		f, err := os.Open(fmt.Sprintf("%s.%d", pth, i-1))
-		if err != nil {
-			if !os.IsNotExist(err) {
-				logWatcher.Err <- err
-				break
-			}
-			continue
-		}
-		defer f.Close()
-		files = append(files, f)
-	}
-
-	latestFile, err := os.Open(pth)
-	if err != nil {
-		logWatcher.Err <- err
-		return
-	}
-	defer latestFile.Close()
-
-	files = append(files, latestFile)
-	tailer := ioutils.MultiReadSeeker(files...)
-
-	if config.Tail != 0 {
-		tailFile(tailer, logWatcher, config.Tail, config.Since)
-	}
-
-	if !config.Follow {
-		return
-	}
-
-	if config.Tail >= 0 {
-		latestFile.Seek(0, os.SEEK_END)
-	}
+func (l *JSONFileLogger) readLogs(watcher *logger.LogWatcher, config logger.ReadConfig) {
+	defer close(watcher.Msg)
 
 	l.mu.Lock()
-	l.readers[logWatcher] = struct{}{}
+	l.readers[watcher] = struct{}{}
 	l.mu.Unlock()
 
-	notifyRotate := l.writer.NotifyRotate()
-	followLogs(latestFile, logWatcher, notifyRotate, config.Since)
+	l.writer.ReadLogs(config, watcher)
 
 	l.mu.Lock()
-	delete(l.readers, logWatcher)
+	delete(l.readers, watcher)
 	l.mu.Unlock()
-
-	l.writer.NotifyRotateEvict(notifyRotate)
 }
 
-func tailFile(f io.ReadSeeker, logWatcher *logger.LogWatcher, tail int, since time.Time) {
-	var rdr io.Reader = f
-	if tail > 0 {
-		ls, err := tailfile.TailFile(f, tail)
-		if err != nil {
-			logWatcher.Err <- err
-			return
-		}
-		rdr = bytes.NewBuffer(bytes.Join(ls, []byte("\n")))
+func decodeLogLine(dec *json.Decoder, l *jsonlog.JSONLog) (*logger.Message, error) {
+	l.Reset()
+	if err := dec.Decode(l); err != nil {
+		return nil, err
 	}
-	dec := json.NewDecoder(rdr)
-	l := &jsonlog.JSONLog{}
-	for {
-		msg, err := decodeLogLine(dec, l)
-		if err != nil {
-			if err != io.EOF {
-				logWatcher.Err <- err
-			}
-			return
+
+	var attrs []backend.LogAttr
+	if len(l.Attrs) != 0 {
+		attrs = make([]backend.LogAttr, 0, len(l.Attrs))
+		for k, v := range l.Attrs {
+			attrs = append(attrs, backend.LogAttr{Key: k, Value: v})
 		}
-		if !since.IsZero() && msg.Timestamp.Before(since) {
-			continue
-		}
-		logWatcher.Msg <- msg
+	}
+	msg := &logger.Message{
+		Source:    l.Stream,
+		Timestamp: l.Created,
+		Line:      []byte(l.Log),
+		Attrs:     attrs,
+	}
+	return msg, nil
+}
+
+type decoder struct {
+	rdr io.Reader
+	dec *json.Decoder
+	jl  *jsonlog.JSONLog
+}
+
+func (d *decoder) Reset(rdr io.Reader) {
+	d.rdr = rdr
+	d.dec = nil
+	if d.jl != nil {
+		d.jl.Reset()
 	}
 }
 
-func followLogs(f *os.File, logWatcher *logger.LogWatcher, notifyRotate chan interface{}, since time.Time) {
-	dec := json.NewDecoder(f)
-	l := &jsonlog.JSONLog{}
+func (d *decoder) Close() {
+	d.dec = nil
+	d.rdr = nil
+	d.jl = nil
+}
 
-	fileWatcher, err := filenotify.New()
-	if err != nil {
-		logWatcher.Err <- err
+func (d *decoder) Decode() (msg *logger.Message, err error) {
+	if d.dec == nil {
+		d.dec = json.NewDecoder(d.rdr)
 	}
-	defer fileWatcher.Close()
-
-	var retries int
-	for {
-		msg, err := decodeLogLine(dec, l)
-		if err != nil {
-			if err != io.EOF {
-				// try again because this shouldn't happen
-				if _, ok := err.(*json.SyntaxError); ok && retries <= maxJSONDecodeRetry {
-					dec = json.NewDecoder(f)
-					retries++
-					continue
-				}
-
-				// io.ErrUnexpectedEOF is returned from json.Decoder when there is
-				// remaining data in the parser's buffer while an io.EOF occurs.
-				// If the json logger writes a partial json log entry to the disk
-				// while at the same time the decoder tries to decode it, the race condition happens.
-				if err == io.ErrUnexpectedEOF && retries <= maxJSONDecodeRetry {
-					reader := io.MultiReader(dec.Buffered(), f)
-					dec = json.NewDecoder(reader)
-					retries++
-					continue
-				}
-				logWatcher.Err <- err
-				return
-			}
-
-			logrus.WithField("logger", "json-file").Debugf("waiting for events")
-			if err := fileWatcher.Add(f.Name()); err != nil {
-				logrus.WithField("logger", "json-file").Warn("falling back to file poller")
-				fileWatcher.Close()
-				fileWatcher = filenotify.NewPollingWatcher()
-				if err := fileWatcher.Add(f.Name()); err != nil {
-					logrus.Errorf("error watching log file for modifications: %v", err)
-					logWatcher.Err <- err
-				}
-			}
-			select {
-			case <-fileWatcher.Events():
-				dec = json.NewDecoder(f)
-				fileWatcher.Remove(f.Name())
-				continue
-			case <-fileWatcher.Errors():
-				fileWatcher.Remove(f.Name())
-				logWatcher.Err <- err
-				return
-			case <-logWatcher.WatchClose():
-				fileWatcher.Remove(f.Name())
-				return
-			case <-notifyRotate:
-				f, err = os.Open(f.Name())
-				if err != nil {
-					logWatcher.Err <- err
-					return
-				}
-
-				dec = json.NewDecoder(f)
-				fileWatcher.Remove(f.Name())
-				fileWatcher.Add(f.Name())
-				continue
-			}
+	if d.jl == nil {
+		d.jl = &jsonlog.JSONLog{}
+	}
+	for retries := 0; retries < maxJSONDecodeRetry; retries++ {
+		msg, err = decodeLogLine(d.dec, d.jl)
+		if err == nil || err == io.EOF {
+			break
 		}
 
-		retries = 0 // reset retries since we've succeeded
-		if !since.IsZero() && msg.Timestamp.Before(since) {
+		logrus.WithError(err).WithField("retries", retries).Warn("got error while decoding json")
+		// try again, could be due to a an incomplete json object as we read
+		if _, ok := err.(*json.SyntaxError); ok {
+			d.dec = json.NewDecoder(d.rdr)
 			continue
 		}
-		select {
-		case logWatcher.Msg <- msg:
-		case <-logWatcher.WatchClose():
-			logWatcher.Msg <- msg
-			for {
-				msg, err := decodeLogLine(dec, l)
-				if err != nil {
-					return
-				}
-				if !since.IsZero() && msg.Timestamp.Before(since) {
-					continue
-				}
-				logWatcher.Msg <- msg
-			}
+
+		// io.ErrUnexpectedEOF is returned from json.Decoder when there is
+		// remaining data in the parser's buffer while an io.EOF occurs.
+		// If the json logger writes a partial json log entry to the disk
+		// while at the same time the decoder tries to decode it, the race condition happens.
+		if err == io.ErrUnexpectedEOF {
+			d.rdr = io.MultiReader(d.dec.Buffered(), d.rdr)
+			d.dec = json.NewDecoder(d.rdr)
+			continue
 		}
 	}
+	return msg, err
+}
+
+// decodeFunc is used to create a decoder for the log file reader
+func decodeFunc(rdr io.Reader) loggerutils.Decoder {
+	return &decoder{
+		rdr: rdr,
+		dec: nil,
+		jl:  nil,
+	}
+}
+
+func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (io.Reader, int, error) {
+	return tailfile.NewTailReader(ctx, r, req)
 }

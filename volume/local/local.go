@@ -1,20 +1,25 @@
 // Package local provides the default implementation for volumes. It
 // is used to mount data volume containers and directories local to
 // the host server.
-package local
+package local // import "github.com/docker/docker/volume/local"
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 
-	derr "github.com/docker/docker/errors"
+	"github.com/docker/docker/daemon/names"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/utils"
 	"github.com/docker/docker/volume"
+	"github.com/moby/sys/mount"
+	"github.com/moby/sys/mountinfo"
+	"github.com/pkg/errors"
 )
 
 // VolumeDataPathName is the name of the directory where the volume data is stored.
@@ -27,29 +32,33 @@ const (
 
 var (
 	// ErrNotFound is the typed error returned when the requested volume name can't be found
-	ErrNotFound = errors.New("volume not found")
+	ErrNotFound = fmt.Errorf("volume not found")
 	// volumeNameRegex ensures the name assigned for the volume is valid.
 	// This name is used to create the bind directory, so we need to avoid characters that
 	// would make the path to escape the root directory.
-	volumeNameRegex = utils.RestrictedVolumeNamePattern
+	volumeNameRegex = names.RestrictedNamePattern
 )
+
+type activeMount struct {
+	count   uint64
+	mounted bool
+}
 
 // New instantiates a new Root instance with the provided scope. Scope
 // is the base path that the Root instance uses to store its
 // volumes. The base path is created here if it does not exist.
-func New(scope string, rootUID, rootGID int) (*Root, error) {
+func New(scope string, rootIdentity idtools.Identity) (*Root, error) {
 	rootDirectory := filepath.Join(scope, volumesPathName)
 
-	if err := idtools.MkdirAllAs(rootDirectory, 0700, rootUID, rootGID); err != nil {
+	if err := idtools.MkdirAllAndChown(rootDirectory, 0700, rootIdentity); err != nil {
 		return nil, err
 	}
 
 	r := &Root{
-		scope:   scope,
-		path:    rootDirectory,
-		volumes: make(map[string]*localVolume),
-		rootUID: rootUID,
-		rootGID: rootGID,
+		scope:        scope,
+		path:         rootDirectory,
+		volumes:      make(map[string]*localVolume),
+		rootIdentity: rootIdentity,
 	}
 
 	dirs, err := ioutil.ReadDir(rootDirectory)
@@ -58,11 +67,31 @@ func New(scope string, rootUID, rootGID int) (*Root, error) {
 	}
 
 	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+
 		name := filepath.Base(d.Name())
-		r.volumes[name] = &localVolume{
+		v := &localVolume{
 			driverName: r.Name(),
 			name:       name,
 			path:       r.DataPath(name),
+		}
+		r.volumes[name] = v
+		optsFilePath := filepath.Join(rootDirectory, name, "opts.json")
+		if b, err := ioutil.ReadFile(optsFilePath); err == nil {
+			opts := optsConfig{}
+			if err := json.Unmarshal(b, &opts); err != nil {
+				return nil, errors.Wrapf(err, "error while unmarshaling volume options for volume: %s", name)
+			}
+			// Make sure this isn't an empty optsConfig.
+			// This could be empty due to buggy behavior in older versions of Docker.
+			if !reflect.DeepEqual(opts, optsConfig{}) {
+				v.opts = &opts
+			}
+
+			// unmount anything that may still be mounted (for example, from an unclean shutdown)
+			mount.Unmount(v.path)
 		}
 	}
 
@@ -73,20 +102,21 @@ func New(scope string, rootUID, rootGID int) (*Root, error) {
 // manages the creation/removal of volumes. It uses only standard vfs
 // commands to create/remove dirs within its provided scope.
 type Root struct {
-	m       sync.Mutex
-	scope   string
-	path    string
-	volumes map[string]*localVolume
-	rootUID int
-	rootGID int
+	m            sync.Mutex
+	scope        string
+	path         string
+	volumes      map[string]*localVolume
+	rootIdentity idtools.Identity
 }
 
 // List lists all the volumes
 func (r *Root) List() ([]volume.Volume, error) {
 	var ls []volume.Volume
+	r.m.Lock()
 	for _, v := range r.volumes {
 		ls = append(ls, v)
 	}
+	r.m.Unlock()
 	return ls, nil
 }
 
@@ -103,7 +133,7 @@ func (r *Root) Name() string {
 // Create creates a new volume.Volume with the provided name, creating
 // the underlying directory tree required for this volume in the
 // process.
-func (r *Root) Create(name string, _ map[string]string) (volume.Volume, error) {
+func (r *Root) Create(name string, opts map[string]string) (volume.Volume, error) {
 	if err := r.validateName(name); err != nil {
 		return nil, err
 	}
@@ -117,17 +147,37 @@ func (r *Root) Create(name string, _ map[string]string) (volume.Volume, error) {
 	}
 
 	path := r.DataPath(name)
-	if err := idtools.MkdirAllAs(path, 0755, r.rootUID, r.rootGID); err != nil {
-		if os.IsExist(err) {
-			return nil, fmt.Errorf("volume already exists under %s", filepath.Dir(path))
-		}
-		return nil, err
+	if err := idtools.MkdirAllAndChown(path, 0755, r.rootIdentity); err != nil {
+		return nil, errors.Wrapf(errdefs.System(err), "error while creating volume path '%s'", path)
 	}
+
+	var err error
+	defer func() {
+		if err != nil {
+			os.RemoveAll(filepath.Dir(path))
+		}
+	}()
+
 	v = &localVolume{
 		driverName: r.Name(),
 		name:       name,
 		path:       path,
 	}
+
+	if len(opts) != 0 {
+		if err = setOpts(v, opts); err != nil {
+			return nil, err
+		}
+		var b []byte
+		b, err = json.Marshal(v.opts)
+		if err != nil {
+			return nil, err
+		}
+		if err = ioutil.WriteFile(filepath.Join(filepath.Dir(path), "opts.json"), b, 0600); err != nil {
+			return nil, errdefs.System(errors.Wrap(err, "error while persisting volume options"))
+		}
+	}
+
 	r.volumes[name] = v
 	return v, nil
 }
@@ -142,7 +192,15 @@ func (r *Root) Remove(v volume.Volume) error {
 
 	lv, ok := v.(*localVolume)
 	if !ok {
-		return errors.New("unknown volume type")
+		return errdefs.System(errors.Errorf("unknown volume type %T", v))
+	}
+
+	if lv.active.count > 0 {
+		return errdefs.System(errors.Errorf("volume has active mounts"))
+	}
+
+	if err := lv.unmount(); err != nil {
+		return err
 	}
 
 	realPath, err := filepath.EvalSymlinks(lv.path)
@@ -154,7 +212,7 @@ func (r *Root) Remove(v volume.Volume) error {
 	}
 
 	if !r.scopedPath(realPath) {
-		return fmt.Errorf("Unable to remove a directory of out the Docker root %s: %s", r.scope, realPath)
+		return errdefs.System(errors.Errorf("Unable to remove a directory outside of the local volume root %s: %s", r.scope, realPath))
 	}
 
 	if err := removePath(realPath); err != nil {
@@ -170,7 +228,7 @@ func removePath(path string) error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return errdefs.System(errors.Wrapf(err, "error removing volume path '%s'", path))
 	}
 	return nil
 }
@@ -186,9 +244,17 @@ func (r *Root) Get(name string) (volume.Volume, error) {
 	return v, nil
 }
 
+// Scope returns the local volume scope
+func (r *Root) Scope() string {
+	return volume.LocalScope
+}
+
 func (r *Root) validateName(name string) error {
+	if len(name) == 1 {
+		return errdefs.InvalidParameter(errors.New("volume name is too short, names should be at least two alphanumeric characters"))
+	}
 	if !volumeNameRegex.MatchString(name) {
-		return derr.ErrorCodeVolumeName.WithArgs(name, utils.RestrictedNameChars)
+		return errdefs.InvalidParameter(errors.Errorf("%q includes invalid characters for a local volume name, only %q are allowed. If you intended to pass a host directory, use absolute path", name, names.RestrictedNameChars))
 	}
 	return nil
 }
@@ -196,14 +262,17 @@ func (r *Root) validateName(name string) error {
 // localVolume implements the Volume interface from the volume package and
 // represents the volumes created by Root.
 type localVolume struct {
-	m         sync.Mutex
-	usedCount int
+	m sync.Mutex
 	// unique name of the volume
 	name string
 	// path is the path on the host where the data lives
 	path string
 	// driverName is the name of the driver that created the volume.
 	driverName string
+	// opts is the parsed list of options used to create the volume
+	opts *optsConfig
+	// active refcounts the active mounts
+	active activeMount
 }
 
 // Name returns the name of the given Volume.
@@ -221,12 +290,73 @@ func (v *localVolume) Path() string {
 	return v.path
 }
 
+// CachedPath returns the data location
+func (v *localVolume) CachedPath() string {
+	return v.path
+}
+
 // Mount implements the localVolume interface, returning the data location.
-func (v *localVolume) Mount() (string, error) {
+// If there are any provided mount options, the resources will be mounted at this point
+func (v *localVolume) Mount(id string) (string, error) {
+	v.m.Lock()
+	defer v.m.Unlock()
+	if v.opts != nil {
+		if !v.active.mounted {
+			if err := v.mount(); err != nil {
+				return "", errdefs.System(err)
+			}
+			v.active.mounted = true
+		}
+		v.active.count++
+	}
 	return v.path, nil
 }
 
-// Umount is for satisfying the localVolume interface and does not do anything in this driver.
-func (v *localVolume) Unmount() error {
+// Unmount dereferences the id, and if it is the last reference will unmount any resources
+// that were previously mounted.
+func (v *localVolume) Unmount(id string) error {
+	v.m.Lock()
+	defer v.m.Unlock()
+
+	// Always decrement the count, even if the unmount fails
+	// Essentially docker doesn't care if this fails, it will send an error, but
+	// ultimately there's nothing that can be done. If we don't decrement the count
+	// this volume can never be removed until a daemon restart occurs.
+	if v.opts != nil {
+		v.active.count--
+	}
+
+	if v.active.count > 0 {
+		return nil
+	}
+
+	return v.unmount()
+}
+
+func (v *localVolume) unmount() error {
+	if v.opts != nil {
+		if err := mount.Unmount(v.path); err != nil {
+			if mounted, mErr := mountinfo.Mounted(v.path); mounted || mErr != nil {
+				return errdefs.System(err)
+			}
+		}
+		v.active.mounted = false
+	}
 	return nil
+}
+
+func (v *localVolume) Status() map[string]interface{} {
+	return nil
+}
+
+// getAddress finds out address/hostname from options
+func getAddress(opts string) string {
+	optsList := strings.Split(opts, ",")
+	for i := 0; i < len(optsList); i++ {
+		if strings.HasPrefix(optsList[i], "addr=") {
+			addr := strings.SplitN(optsList[i], "=", 2)[1]
+			return addr
+		}
+	}
+	return ""
 }

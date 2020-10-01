@@ -1,4 +1,4 @@
-package archive
+package archive // import "github.com/docker/docker/pkg/archive"
 
 import (
 	"archive/tar"
@@ -323,7 +323,9 @@ func makeTestLayer(paths []string) (rc io.ReadCloser, err error) {
 		}
 	}()
 	for _, p := range paths {
-		if p[len(p)-1] == filepath.Separator {
+		// Source files are always in Unix format. But we use filepath on
+		// creation to be platform agnostic.
+		if p[len(p)-1] == '/' {
 			if err = os.MkdirAll(filepath.Join(tmpDir, p), 0700); err != nil {
 				return
 			}
@@ -358,9 +360,10 @@ func readDirContents(root string) ([]string, error) {
 			return err
 		}
 		if info.IsDir() {
-			rel = rel + "/"
+			rel = rel + string(filepath.Separator)
 		}
-		files = append(files, rel)
+		// Append in Unix semantics
+		files = append(files, filepath.ToSlash(rel))
 		return nil
 	})
 	if err != nil {

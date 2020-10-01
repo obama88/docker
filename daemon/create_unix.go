@@ -1,39 +1,54 @@
 // +build !windows
 
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 
-	"github.com/Sirupsen/logrus"
+	containertypes "github.com/docker/docker/api/types/container"
+	mounttypes "github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/container"
-	derr "github.com/docker/docker/errors"
-	"github.com/docker/docker/image"
+	"github.com/docker/docker/oci"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/volume"
-	containertypes "github.com/docker/engine-api/types/container"
-	"github.com/opencontainers/runc/libcontainer/label"
+	volumeopts "github.com/docker/docker/volume/service/opts"
+	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/sirupsen/logrus"
 )
 
-// createContainerPlatformSpecificSettings performs platform specific container create functionality
-func (daemon *Daemon) createContainerPlatformSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig, img *image.Image) error {
+// createContainerOSSpecificSettings performs host-OS specific container create functionality
+func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
 	if err := daemon.Mount(container); err != nil {
 		return err
 	}
 	defer daemon.Unmount(container)
 
-	if err := container.SetupWorkingDirectory(); err != nil {
+	rootIDs := daemon.idMapping.RootPair()
+	if err := container.SetupWorkingDirectory(rootIDs); err != nil {
 		return err
 	}
 
+	// Set the default masked and readonly paths with regard to the host config options if they are not set.
+	if hostConfig.MaskedPaths == nil && !hostConfig.Privileged {
+		hostConfig.MaskedPaths = oci.DefaultSpec().Linux.MaskedPaths // Set it to the default if nil
+		container.HostConfig.MaskedPaths = hostConfig.MaskedPaths
+	}
+	if hostConfig.ReadonlyPaths == nil && !hostConfig.Privileged {
+		hostConfig.ReadonlyPaths = oci.DefaultSpec().Linux.ReadonlyPaths // Set it to the default if nil
+		container.HostConfig.ReadonlyPaths = hostConfig.ReadonlyPaths
+	}
+
 	for spec := range config.Volumes {
-		name := stringid.GenerateNonCryptoID()
+		name := stringid.GenerateRandomID()
 		destination := filepath.Clean(spec)
 
 		// Skip volumes for which we already have something mounted on that
 		// destination because of a --volume-from.
-		if container.IsDestinationMounted(destination) {
+		if container.HasMountFor(destination) {
+			logrus.WithField("container", container.ID).WithField("destination", spec).Debug("mountpoint already exists, skipping anonymous volume")
+			// Not an error, this could easily have come from the image config.
 			continue
 		}
 		path, err := container.GetResourcePath(destination)
@@ -43,29 +58,19 @@ func (daemon *Daemon) createContainerPlatformSpecificSettings(container *contain
 
 		stat, err := os.Stat(path)
 		if err == nil && !stat.IsDir() {
-			return derr.ErrorCodeMountOverFile.WithArgs(path)
+			return fmt.Errorf("cannot mount volume over existing file, file exists %s", path)
 		}
 
-		volumeDriver := hostConfig.VolumeDriver
-		if destination != "" && img != nil {
-			if _, ok := img.ContainerConfig.Volumes[destination]; ok {
-				// check for whether bind is not specified and then set to local
-				if _, ok := container.MountPoints[destination]; !ok {
-					volumeDriver = volume.DefaultDriverName
-				}
-			}
-		}
-
-		v, err := daemon.volumes.CreateWithRef(name, volumeDriver, container.ID, nil)
+		v, err := daemon.volumes.Create(context.TODO(), name, hostConfig.VolumeDriver, volumeopts.WithCreateReference(container.ID))
 		if err != nil {
 			return err
 		}
 
-		if err := label.Relabel(v.Path(), container.MountLabel, true); err != nil {
+		if err := label.Relabel(v.Mountpoint, container.MountLabel, true); err != nil {
 			return err
 		}
 
-		container.AddMountPointWithVolume(destination, v, true)
+		container.AddMountPointWithVolume(destination, &volumeWrapper{v: v, s: daemon.volumes}, true)
 	}
 	return daemon.populateVolumes(container)
 }
@@ -74,8 +79,11 @@ func (daemon *Daemon) createContainerPlatformSpecificSettings(container *contain
 // this is only called when the container is created.
 func (daemon *Daemon) populateVolumes(c *container.Container) error {
 	for _, mnt := range c.MountPoints {
-		// skip binds and volumes referenced by other containers (ie, volumes-from)
-		if mnt.Driver == "" || mnt.Volume == nil || len(daemon.volumes.Refs(mnt.Volume)) > 1 {
+		if mnt.Volume == nil {
+			continue
+		}
+
+		if mnt.Type != mounttypes.TypeVolume || !mnt.CopyData {
 			continue
 		}
 

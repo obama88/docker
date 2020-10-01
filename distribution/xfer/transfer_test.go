@@ -1,4 +1,4 @@
-package xfer
+package xfer // import "github.com/docker/docker/distribution/xfer"
 
 import (
 	"sync/atomic"
@@ -10,11 +10,11 @@ import (
 
 func TestTransfer(t *testing.T) {
 	makeXferFunc := func(id string) DoFunc {
-		return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
+		return func(progressChan chan<- progress.Progress, start <-chan struct{}, _ chan<- struct{}) Transfer {
 			select {
 			case <-start:
 			default:
-				t.Fatalf("transfer function not started even though concurrency limit not reached")
+				t.Errorf("%s: transfer function not started even though concurrency limit not reached", id)
 			}
 
 			xfer := NewTransfer()
@@ -37,21 +37,8 @@ func TestTransfer(t *testing.T) {
 	go func() {
 		for p := range progressChan {
 			val, present := receivedProgress[p.ID]
-			if !present {
-				if p.Current != 0 {
-					t.Fatalf("got unexpected progress value: %d (expected 0)", p.Current)
-				}
-			} else if p.Current == 10 {
-				// Special case: last progress output may be
-				// repeated because the transfer finishing
-				// causes the latest progress output to be
-				// written to the channel (in case the watcher
-				// missed it).
-				if p.Current != 9 && p.Current != 10 {
-					t.Fatalf("got unexpected progress value: %d (expected %d)", p.Current, val+1)
-				}
-			} else if p.Current != val+1 {
-				t.Fatalf("got unexpected progress value: %d (expected %d)", p.Current, val+1)
+			if present && p.Current <= val {
+				t.Errorf("%s: got unexpected progress value: %d (expected <= %d)", p.ID, p.Current, val)
 			}
 			receivedProgress[p.ID] = p.Current
 		}
@@ -85,13 +72,13 @@ func TestConcurrencyLimit(t *testing.T) {
 	var runningJobs int32
 
 	makeXferFunc := func(id string) DoFunc {
-		return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
+		return func(progressChan chan<- progress.Progress, start <-chan struct{}, _ chan<- struct{}) Transfer {
 			xfer := NewTransfer()
 			go func() {
 				<-start
 				totalJobs := atomic.AddInt32(&runningJobs, 1)
 				if int(totalJobs) > concurrencyLimit {
-					t.Fatalf("too many jobs running")
+					t.Errorf("%s: too many jobs running (%d > %d)", id, totalJobs, concurrencyLimit)
 				}
 				for i := 0; i <= 10; i++ {
 					progressChan <- progress.Progress{ID: id, Action: "testing", Current: int64(i), Total: 10}
@@ -150,7 +137,7 @@ func TestInactiveJobs(t *testing.T) {
 				<-start
 				totalJobs := atomic.AddInt32(&runningJobs, 1)
 				if int(totalJobs) > concurrencyLimit {
-					t.Fatalf("too many jobs running")
+					t.Errorf("%s: too many jobs running (%d > %d)", id, totalJobs, concurrencyLimit)
 				}
 				for i := 0; i <= 10; i++ {
 					progressChan <- progress.Progress{ID: id, Action: "testing", Current: int64(i), Total: 10}
@@ -204,7 +191,7 @@ func TestWatchRelease(t *testing.T) {
 	ready := make(chan struct{})
 
 	makeXferFunc := func(id string) DoFunc {
-		return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
+		return func(progressChan chan<- progress.Progress, start <-chan struct{}, _ chan<- struct{}) Transfer {
 			xfer := NewTransfer()
 			go func() {
 				defer func() {
@@ -291,13 +278,51 @@ func TestWatchRelease(t *testing.T) {
 	}
 }
 
+func TestWatchFinishedTransfer(t *testing.T) {
+	makeXferFunc := func(id string) DoFunc {
+		return func(progressChan chan<- progress.Progress, _ <-chan struct{}, _ chan<- struct{}) Transfer {
+			xfer := NewTransfer()
+			go func() {
+				// Finish immediately
+				close(progressChan)
+			}()
+			return xfer
+		}
+	}
+
+	tm := NewTransferManager(5)
+
+	// Start a transfer
+	watchers := make([]*Watcher, 3)
+	var xfer Transfer
+	xfer, watchers[0] = tm.Transfer("id1", makeXferFunc("id1"), progress.ChanOutput(make(chan progress.Progress)))
+
+	// Give it a watcher immediately
+	watchers[1] = xfer.Watch(progress.ChanOutput(make(chan progress.Progress)))
+
+	// Wait for the transfer to complete
+	<-xfer.Done()
+
+	// Set up another watcher
+	watchers[2] = xfer.Watch(progress.ChanOutput(make(chan progress.Progress)))
+
+	// Release the watchers
+	for _, w := range watchers {
+		xfer.Release(w)
+	}
+
+	// Now that all watchers have been released, Released() should
+	// return a closed channel.
+	<-xfer.Released()
+}
+
 func TestDuplicateTransfer(t *testing.T) {
 	ready := make(chan struct{})
 
 	var xferFuncCalls int32
 
 	makeXferFunc := func(id string) DoFunc {
-		return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
+		return func(progressChan chan<- progress.Progress, _ <-chan struct{}, _ chan<- struct{}) Transfer {
 			atomic.AddInt32(&xferFuncCalls, 1)
 			xfer := NewTransfer()
 			go func() {

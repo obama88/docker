@@ -1,15 +1,21 @@
-package distribution
+package distribution // import "github.com/docker/docker/distribution"
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"reflect"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest/schema1"
-	"github.com/docker/docker/reference"
+	"github.com/docker/distribution/reference"
+	digest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 // TestFixManifestLayers checks that fixManifestLayers removes a duplicate
@@ -62,6 +68,10 @@ func TestFixManifestLayers(t *testing.T) {
 // TestFixManifestLayersBaseLayerParent makes sure that fixManifestLayers fails
 // if the base layer configuration specifies a parent.
 func TestFixManifestLayersBaseLayerParent(t *testing.T) {
+	// TODO Windows: Fix this unit text
+	if runtime.GOOS == "windows" {
+		t.Skip("Needs fixing on Windows")
+	}
 	duplicateLayerManifest := schema1.Manifest{
 		FSLayers: []schema1.FSLayer{
 			{BlobSum: digest.Digest("sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4")},
@@ -75,7 +85,7 @@ func TestFixManifestLayersBaseLayerParent(t *testing.T) {
 		},
 	}
 
-	if err := fixManifestLayers(&duplicateLayerManifest); err == nil || !strings.Contains(err.Error(), "Invalid parent ID in the base layer of the image.") {
+	if err := fixManifestLayers(&duplicateLayerManifest); err == nil || !strings.Contains(err.Error(), "invalid parent ID in the base layer of the image") {
 		t.Fatalf("expected an invalid parent ID error from fixManifestLayers")
 	}
 }
@@ -97,14 +107,17 @@ func TestFixManifestLayersBadParent(t *testing.T) {
 		},
 	}
 
-	if err := fixManifestLayers(&duplicateLayerManifest); err == nil || !strings.Contains(err.Error(), "Invalid parent ID.") {
-		t.Fatalf("expected an invalid parent ID error from fixManifestLayers")
-	}
+	err := fixManifestLayers(&duplicateLayerManifest)
+	assert.Check(t, is.ErrorContains(err, "invalid parent ID"))
 }
 
 // TestValidateManifest verifies the validateManifest function
 func TestValidateManifest(t *testing.T) {
-	expectedDigest, err := reference.ParseNamed("repo@sha256:02fee8c3220ba806531f606525eceb83f4feb654f62b207191b1c9209188dedd")
+	// TODO Windows: Fix this unit text
+	if runtime.GOOS == "windows" {
+		t.Skip("Needs fixing on Windows")
+	}
+	expectedDigest, err := reference.ParseNormalizedNamed("repo@sha256:02fee8c3220ba806531f606525eceb83f4feb654f62b207191b1c9209188dedd")
 	if err != nil {
 		t.Fatal("could not parse reference")
 	}
@@ -167,8 +180,28 @@ func TestValidateManifest(t *testing.T) {
 		t.Fatal("error unmarshaling manifest:", err)
 	}
 
-	verifiedManifest, err = verifySchema1Manifest(&badSignedManifest, expectedDigest)
+	_, err = verifySchema1Manifest(&badSignedManifest, expectedDigest)
 	if err == nil || !strings.HasPrefix(err.Error(), "image verification failed for digest") {
 		t.Fatal("expected validateManifest to fail with digest error")
+	}
+}
+
+func TestFormatPlatform(t *testing.T) {
+	var platform specs.Platform
+	var result = formatPlatform(platform)
+	if strings.HasPrefix(result, "unknown") {
+		t.Fatal("expected formatPlatform to show a known platform")
+	}
+	if !strings.HasPrefix(result, runtime.GOOS) {
+		t.Fatal("expected formatPlatform to show the current platform")
+	}
+	if runtime.GOOS == "windows" {
+		if !strings.HasPrefix(result, "windows") {
+			t.Fatal("expected formatPlatform to show windows platform")
+		}
+		matches, _ := regexp.MatchString("windows.* [0-9]", result)
+		if !matches {
+			t.Fatal(fmt.Sprintf("expected formatPlatform to show windows platform with a version, but got '%s'", result))
+		}
 	}
 }

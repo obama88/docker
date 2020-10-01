@@ -1,12 +1,14 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/execdriver"
-	"github.com/docker/engine-api/types"
+	"github.com/docker/docker/daemon/exec"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-// setPlatformSpecificExecProcessConfig sets platform-specific fields in the
-// ProcessConfig structure. This is a no-op on Windows
-func setPlatformSpecificExecProcessConfig(config *types.ExecConfig, container *container.Container, pc *execdriver.ProcessConfig) {
+func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config, p *specs.Process) error {
+	if c.OS == "windows" {
+		p.User.Username = ec.User
+	}
+	return nil
 }
